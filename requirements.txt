@@ -1,7 +1,8 @@
 streamlit
-pytesseract
 pillow
 pandas
 openpyxl
-google-generativeai
-opencv-python-headless
+paddleocr
+paddlepaddle
+numpy
+opencv-python

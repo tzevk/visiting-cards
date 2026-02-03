@@ -1,15 +1,16 @@
 import streamlit as st
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image
 import pandas as pd
 import numpy as np
 import cv2
 import re
-import os
 from datetime import datetime
 import easyocr
 
+
 # ================= CONFIG =================
 st.set_page_config(page_title="Business Card Scanner", layout="centered")
+
 
 @st.cache_resource
 def get_ocr():
@@ -22,38 +23,97 @@ ocr = get_ocr()
 # ================= 1. IMAGE PREPROCESSING =================
 def preprocess_image(img):
     """
-    Fast preprocessing for OCR.
+    Enhanced preprocessing for better OCR accuracy.
     """
     # Convert PIL to OpenCV format
     img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
     
-    # Resize to optimal size (smaller = faster)
+    # Resize to optimal size for OCR
     height, width = img_cv.shape[:2]    
-    target_width = 1200
-    if width > target_width:
+    target_width = 1500
+    if width != target_width:
         scale = target_width / width
-        img_cv = cv2.resize(img_cv, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+        img_cv = cv2.resize(img_cv, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
     
-    # Simple contrast enhancement
+    # Convert to grayscale
     gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
-    processed = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+    
+    # Denoise
+    denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+    
+    # Enhance contrast with CLAHE
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    enhanced = clahe.apply(denoised)
+    
+    # Sharpen the image
+    kernel_sharpen = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    sharpened = cv2.filter2D(enhanced, -1, kernel_sharpen)
+    
+    # Convert back to BGR
+    processed = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
     
     return img_cv, processed
 
 
+def preprocess_high_contrast(img_cv):
+    """
+    High contrast preprocessing - good for faded or low contrast cards.
+    """
+    # Convert to LAB color space for better contrast adjustment
+    lab = cv2.cvtColor(img_cv, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    
+    # Strong CLAHE on L channel
+    clahe = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    
+    # Merge and convert back
+    lab = cv2.merge([l, a, b])
+    result = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    
+    # Convert to grayscale and enhance edges
+    gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
+    
+    # Unsharp masking for edge enhancement
+    blur = cv2.GaussianBlur(gray, (5, 5), 1.0)
+    unsharp = cv2.addWeighted(gray, 1.5, blur, -0.5, 0)
+    
+    return cv2.cvtColor(unsharp, cv2.COLOR_GRAY2BGR)
+
+
 def preprocess_for_difficult_cards(img_cv):
     """
-    Fallback for difficult cards - only used if first pass fails.
+    Alternative preprocessing for difficult cards (dark backgrounds, low contrast).
     """
     gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    
+    # Strong contrast enhancement
+    clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
+    
+    # Adaptive thresholding for varied lighting
+    adaptive = cv2.adaptiveThreshold(
+        enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+    )
+    
+    # Also try Otsu
     _, otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    if np.mean(otsu) < 127:
-        otsu = cv2.bitwise_not(otsu)
-    return cv2.cvtColor(otsu, cv2.COLOR_GRAY2BGR)
+    
+    # Use whichever has more contrast
+    if np.std(adaptive) > np.std(otsu):
+        result = adaptive
+    else:
+        result = otsu
+    
+    # Invert if background is dark
+    if np.mean(result) < 127:
+        result = cv2.bitwise_not(result)
+    
+    # Morphological cleanup
+    kernel = np.ones((1, 1), np.uint8)
+    result = cv2.morphologyEx(result, cv2.MORPH_CLOSE, kernel)
+    
+    return cv2.cvtColor(result, cv2.COLOR_GRAY2BGR)
 
 
 # ================= 2. OCR ENGINE =================
@@ -73,7 +133,7 @@ def clean_ocr_text(text):
     return cleaned
 
 
-def run_ocr(img_array):
+def run_ocr(img_array, detail=1, paragraph=False, min_size=10):
     """
     Run EasyOCR on preprocessed image.
     Returns list of text lines with position info.
@@ -83,13 +143,13 @@ def run_ocr(img_array):
         img_array = img_array[0]
     
     # EasyOCR returns list of (bbox, text, confidence)
-    result = ocr.readtext(img_array)
+    result = ocr.readtext(img_array, detail=detail, paragraph=paragraph, min_size=min_size)
     
     lines = []
     if result:
         for (bbox, text, score) in result:
             cleaned_text = clean_ocr_text(text)
-            if cleaned_text and len(cleaned_text) > 1 and score > 0.3:
+            if cleaned_text and len(cleaned_text) > 1 and score > 0.2:  # Lower threshold to catch more text
                 # bbox is [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
                 bbox = np.array(bbox)
                 y_pos = (np.min(bbox[:, 1]) + np.max(bbox[:, 1])) / 2
@@ -109,6 +169,67 @@ def run_ocr(img_array):
     lines.sort(key=lambda x: x['y_pos'])
     
     return lines
+
+
+def run_multi_pass_ocr(original_img, processed_img, difficult_img=None, high_contrast_img=None):
+    """
+    Run OCR with multiple preprocessing strategies and merge results.
+    This improves accuracy by combining results from different image treatments.
+    """
+    all_results = []
+    
+    # Pass 1: Enhanced preprocessed image (default)
+    results1 = run_ocr(processed_img)
+    all_results.extend(results1)
+    
+    # Pass 2: Try with smaller min_size for small text
+    results2 = run_ocr(processed_img, min_size=5)
+    all_results.extend(results2)
+    
+    # Pass 3: Original image (sometimes cleaner for good quality cards)
+    if original_img is not None:
+        results3 = run_ocr(original_img)
+        all_results.extend(results3)
+    
+    # Pass 4: Difficult preprocessing if available
+    if difficult_img is not None:
+        results4 = run_ocr(difficult_img)
+        all_results.extend(results4)
+    
+    # Pass 5: High contrast preprocessing if available
+    if high_contrast_img is not None:
+        results5 = run_ocr(high_contrast_img)
+        all_results.extend(results5)
+    
+    # Deduplicate and merge, keeping best results
+    merged = {}
+    for line in all_results:
+        text_key = line['text'].lower().strip()
+        if len(text_key) < 2:
+            continue
+        
+        # Use fuzzy matching - if text is similar, keep the better one
+        found_similar = False
+        for existing_key in list(merged.keys()):
+            # Check for substring or very similar text
+            if text_key in existing_key or existing_key in text_key:
+                # Keep the longer one with better confidence
+                existing = merged[existing_key]
+                if len(line['text']) > len(existing['text']) or line['confidence'] > existing['confidence'] + 0.1:
+                    del merged[existing_key]
+                    merged[text_key] = line
+                found_similar = True
+                break
+        
+        if not found_similar:
+            if text_key not in merged:
+                merged[text_key] = line
+            elif line['confidence'] > merged[text_key]['confidence']:
+                merged[text_key] = line
+    
+    result = list(merged.values())
+    result.sort(key=lambda x: x['y_pos'])
+    return result
 
 
 def merge_ocr_results(lines1, lines2):
@@ -608,18 +729,23 @@ if img:
         st.image(img, caption="Your Business Card", use_container_width=True)
     
     if st.button("🔍 Scan Card", type="primary", use_container_width=True, help="Click to automatically extract contact information from the card"):
-        with st.spinner("Reading the card..."):
+        with st.spinner("Reading the card... This may take a few seconds"):
             try:
-                # Preprocess image
+                # Preprocess image with multiple strategies
                 img_cv, processed = preprocess_image(img)
                 
-                # Single OCR pass on enhanced image (fast)
-                ocr_lines = run_ocr(processed)
+                # Prepare enhanced versions for different card types
+                enhanced = preprocess_for_difficult_cards(img_cv)
+                high_contrast = preprocess_high_contrast(img_cv)
                 
-                # Only try fallback if we got very little text
+                # Run multi-pass OCR for better accuracy
+                ocr_lines = run_multi_pass_ocr(img_cv, processed, enhanced, high_contrast)
+                
+                # Fallback to single pass if multi-pass failed
                 if len(ocr_lines) < 2:
-                    enhanced = preprocess_for_difficult_cards(img_cv)
-                    ocr_lines = run_ocr(enhanced)
+                    ocr_lines = run_ocr(processed)
+                    if len(ocr_lines) < 2:
+                        ocr_lines = run_ocr(enhanced)
                 
                 if ocr_lines:
                     # Parse extracted text

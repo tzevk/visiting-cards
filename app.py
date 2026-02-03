@@ -569,11 +569,13 @@ tab1, tab2 = st.tabs(["📷 Take Photo", "📁 Upload Image"])
 
 with tab1:
     st.markdown("*Position the card flat with good lighting for best results*")
+    st.info("📱 **On mobile?** If the camera doesn't open, please use the **Upload Image** tab instead and take a photo using your phone's camera app.")
     photo = st.camera_input("Take a picture of the business card", label_visibility="collapsed")
 
 with tab2:
     st.markdown("*Supported formats: PNG, JPG, JPEG*")
-    uploaded = st.file_uploader("Select an image file", type=['png', 'jpg', 'jpeg'], label_visibility="collapsed")
+    st.caption("💡 Best option for mobile devices")
+    uploaded = st.file_uploader("Select an image file", type=['png', 'jpg', 'jpeg', 'heic'], label_visibility="collapsed")
 
 # Get image from either source
 img = None

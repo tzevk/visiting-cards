@@ -2,7 +2,6 @@ streamlit
 pillow
 pandas
 openpyxl
-paddleocr
-paddlepaddle
+easyocr
 numpy
 opencv-python-headless

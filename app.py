@@ -6,22 +6,15 @@ import cv2
 import re
 import os
 from datetime import datetime
-
-# Bypass PaddleOCR connectivity check for faster startup
-os.environ['PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK'] = 'True'
-
-from paddleocr import PaddleOCR
+import easyocr
 
 # ================= CONFIG =================
 st.set_page_config(page_title="Business Card Scanner", layout="centered")
 
 @st.cache_resource
 def get_ocr():
-    # Use lightweight settings for faster inference
-    return PaddleOCR(
-        lang='en',
-        use_angle_cls=False  # Disable angle classification for speed
-    )
+    # Use EasyOCR - works better on cloud
+    return easyocr.Reader(['en'], gpu=False)
 
 ocr = get_ocr()
 
@@ -61,7 +54,6 @@ def preprocess_for_difficult_cards(img_cv):
     if np.mean(otsu) < 127:
         otsu = cv2.bitwise_not(otsu)
     return cv2.cvtColor(otsu, cv2.COLOR_GRAY2BGR)
-    return cv2.cvtColor(best, cv2.COLOR_GRAY2BGR)
 
 
 # ================= 2. OCR ENGINE =================
@@ -71,15 +63,6 @@ def clean_ocr_text(text):
     """
     if not text:
         return text
-    
-    # Common OCR substitutions
-    replacements = {
-        '|': 'l',
-        '0': 'O',  # Will be context-dependent
-        '1': 'l',  # Will be context-dependent  
-        '\\': '',
-        '  ': ' ',
-    }
     
     cleaned = text.strip()
     
@@ -92,39 +75,35 @@ def clean_ocr_text(text):
 
 def run_ocr(img_array):
     """
-    Run PaddleOCR on preprocessed image.
+    Run EasyOCR on preprocessed image.
     Returns list of text lines with position info.
     """
     # Ensure we pass a single numpy array (not a tuple or list)
     if isinstance(img_array, tuple):
         img_array = img_array[0]
     
-    result = ocr.predict(img_array)
+    # EasyOCR returns list of (bbox, text, confidence)
+    result = ocr.readtext(img_array)
     
     lines = []
-    if result and len(result) > 0:
-        for item in result:
-            if 'rec_texts' in item and 'dt_polys' in item:
-                texts = item['rec_texts']
-                polys = item['dt_polys']
-                scores = item.get('rec_scores', [1.0] * len(texts))
-                
-                for text, poly, score in zip(texts, polys, scores):
-                    cleaned_text = clean_ocr_text(text)
-                    if cleaned_text and len(cleaned_text) > 1 and score > 0.35:
-                        poly = np.array(poly)
-                        y_pos = (np.min(poly[:, 1]) + np.max(poly[:, 1])) / 2
-                        x_pos = (np.min(poly[:, 0]) + np.max(poly[:, 0])) / 2
-                        text_height = np.max(poly[:, 1]) - np.min(poly[:, 1])
-                        text_width = np.max(poly[:, 0]) - np.min(poly[:, 0])
-                        lines.append({
-                            'text': cleaned_text,
-                            'y_pos': y_pos,
-                            'x_pos': x_pos,
-                            'height': text_height,
-                            'width': text_width,
-                            'confidence': score
-                        })
+    if result:
+        for (bbox, text, score) in result:
+            cleaned_text = clean_ocr_text(text)
+            if cleaned_text and len(cleaned_text) > 1 and score > 0.3:
+                # bbox is [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+                bbox = np.array(bbox)
+                y_pos = (np.min(bbox[:, 1]) + np.max(bbox[:, 1])) / 2
+                x_pos = (np.min(bbox[:, 0]) + np.max(bbox[:, 0])) / 2
+                text_height = np.max(bbox[:, 1]) - np.min(bbox[:, 1])
+                text_width = np.max(bbox[:, 0]) - np.min(bbox[:, 0])
+                lines.append({
+                    'text': cleaned_text,
+                    'y_pos': y_pos,
+                    'x_pos': x_pos,
+                    'height': text_height,
+                    'width': text_width,
+                    'confidence': score
+                })
     
     # Sort by vertical position (top to bottom)
     lines.sort(key=lambda x: x['y_pos'])
@@ -477,6 +456,41 @@ def parse_text(ocr_lines):
             if len(text) >= 2:
                 fields['name'] = text.title()
                 break
+    
+    # ===== EXTRACT NAME FROM EMAIL (if name is too short or missing) =====
+    if fields['email'] and (not fields['name'] or len(fields['name']) < 4):
+        email_local = fields['email'].split('@')[0]
+        # Remove common prefixes/suffixes
+        email_local = re.sub(r'^(info|contact|hello|admin|support|sales|hr)$', '', email_local, flags=re.IGNORECASE)
+        
+        if email_local and len(email_local) >= 3:
+            # Try to split by common separators
+            if '.' in email_local:
+                parts = email_local.split('.')
+                name_from_email = ' '.join(parts).title()
+            elif '_' in email_local:
+                parts = email_local.split('_')
+                name_from_email = ' '.join(parts).title()
+            else:
+                # Try to split camelCase or concatenated names
+                # e.g., "vedikaraut" -> "Vedika Raut"
+                # Insert space before capital letters
+                spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', email_local)
+                # Also try common name patterns (first name + last name concatenated)
+                if spaced == email_local and len(email_local) > 5:
+                    # Try splitting at common points
+                    for i in range(3, len(email_local) - 2):
+                        first = email_local[:i]
+                        last = email_local[i:]
+                        # Both parts should be reasonable lengths
+                        if len(first) >= 3 and len(last) >= 3:
+                            spaced = f"{first} {last}"
+                            break
+                name_from_email = spaced.title()
+            
+            # Use email name if current name is missing or very short
+            if not fields['name'] or len(fields['name']) < 4:
+                fields['name'] = name_from_email
     
     # ===== EXTRACT DESIGNATION =====
     if designation_lines:

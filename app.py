@@ -4,15 +4,24 @@ import pandas as pd
 import numpy as np
 import cv2
 import re
+import os
 from datetime import datetime
+
+# Bypass PaddleOCR connectivity check for faster startup
+os.environ['PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK'] = 'True'
+
 from paddleocr import PaddleOCR
 
 # ================= CONFIG =================
-st.set_page_config(page_title="Visiting Card Scanner", layout="centered")
+st.set_page_config(page_title="Business Card Scanner", layout="centered")
 
 @st.cache_resource
 def get_ocr():
-    return PaddleOCR(use_textline_orientation=True, lang='en')
+    # Use lightweight settings for faster inference
+    return PaddleOCR(
+        lang='en',
+        use_angle_cls=False  # Disable angle classification for speed
+    )
 
 ocr = get_ocr()
 
@@ -20,48 +29,76 @@ ocr = get_ocr()
 # ================= 1. IMAGE PREPROCESSING =================
 def preprocess_image(img):
     """
-    Preprocess image for better OCR accuracy.
-    - Convert to grayscale
-    - Denoise
-    - Increase contrast
-    - Binarize (adaptive threshold)
+    Fast preprocessing for OCR.
     """
     # Convert PIL to OpenCV format
     img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
     
-    # Resize if too small
-    height, width = img_cv.shape[:2]
-    if width < 1000:
-        scale = 1000 / width
-        img_cv = cv2.resize(img_cv, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    # Resize to optimal size (smaller = faster)
+    height, width = img_cv.shape[:2]    
+    target_width = 1200
+    if width > target_width:
+        scale = target_width / width
+        img_cv = cv2.resize(img_cv, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
     
-    # Convert to grayscale
+    # Simple contrast enhancement
     gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-    
-    # Denoise
-    denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
-    
-    # Increase contrast using CLAHE
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    contrast = clahe.apply(denoised)
+    enhanced = clahe.apply(gray)
+    processed = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
     
-    # Adaptive threshold for binarization
-    binary = cv2.adaptiveThreshold(
-        contrast, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-    )
-    
-    # Convert back to RGB for OCR
-    processed = cv2.cvtColor(binary, cv2.COLOR_GRAY2RGB)
-    
-    return processed, img_cv
+    return img_cv, processed
+
+
+def preprocess_for_difficult_cards(img_cv):
+    """
+    Fallback for difficult cards - only used if first pass fails.
+    """
+    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    _, otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.mean(otsu) < 127:
+        otsu = cv2.bitwise_not(otsu)
+    return cv2.cvtColor(otsu, cv2.COLOR_GRAY2BGR)
+    return cv2.cvtColor(best, cv2.COLOR_GRAY2BGR)
 
 
 # ================= 2. OCR ENGINE =================
+def clean_ocr_text(text):
+    """
+    Clean common OCR errors and normalize text.
+    """
+    if not text:
+        return text
+    
+    # Common OCR substitutions
+    replacements = {
+        '|': 'l',
+        '0': 'O',  # Will be context-dependent
+        '1': 'l',  # Will be context-dependent  
+        '\\': '',
+        '  ': ' ',
+    }
+    
+    cleaned = text.strip()
+    
+    # Remove stray special characters at start/end
+    cleaned = re.sub(r'^[^a-zA-Z0-9@+]+', '', cleaned)
+    cleaned = re.sub(r'[^a-zA-Z0-9.]+$', '', cleaned)
+    
+    return cleaned
+
+
 def run_ocr(img_array):
     """
     Run PaddleOCR on preprocessed image.
     Returns list of text lines with position info.
     """
+    # Ensure we pass a single numpy array (not a tuple or list)
+    if isinstance(img_array, tuple):
+        img_array = img_array[0]
+    
     result = ocr.predict(img_array)
     
     lines = []
@@ -73,12 +110,19 @@ def run_ocr(img_array):
                 scores = item.get('rec_scores', [1.0] * len(texts))
                 
                 for text, poly, score in zip(texts, polys, scores):
-                    if text and text.strip() and score > 0.5:
+                    cleaned_text = clean_ocr_text(text)
+                    if cleaned_text and len(cleaned_text) > 1 and score > 0.35:
                         poly = np.array(poly)
                         y_pos = (np.min(poly[:, 1]) + np.max(poly[:, 1])) / 2
+                        x_pos = (np.min(poly[:, 0]) + np.max(poly[:, 0])) / 2
+                        text_height = np.max(poly[:, 1]) - np.min(poly[:, 1])
+                        text_width = np.max(poly[:, 0]) - np.min(poly[:, 0])
                         lines.append({
-                            'text': text.strip(),
+                            'text': cleaned_text,
                             'y_pos': y_pos,
+                            'x_pos': x_pos,
+                            'height': text_height,
+                            'width': text_width,
                             'confidence': score
                         })
     
@@ -86,6 +130,35 @@ def run_ocr(img_array):
     lines.sort(key=lambda x: x['y_pos'])
     
     return lines
+
+
+def merge_ocr_results(lines1, lines2):
+    """
+    Merge OCR results from multiple preprocessing methods.
+    Prefer higher confidence results and longer text.
+    """
+    merged = {}
+    
+    for line in lines1 + lines2:
+        text_lower = line['text'].lower().strip()
+        # Skip very short text
+        if len(text_lower) < 2:
+            continue
+        
+        # Prefer longer text or higher confidence
+        if text_lower not in merged:
+            merged[text_lower] = line
+        else:
+            existing = merged[text_lower]
+            # Prefer higher confidence, or longer original text if similar confidence
+            if line['confidence'] > existing['confidence'] + 0.1:
+                merged[text_lower] = line
+            elif len(line['text']) > len(existing['text']):
+                merged[text_lower] = line
+    
+    result = list(merged.values())
+    result.sort(key=lambda x: x['y_pos'])
+    return result
 
 
 # ================= 3. TEXT PARSING =================
@@ -100,44 +173,74 @@ def parse_text(ocr_lines):
     # Initialize fields
     fields = {
         'name': '',
+        'designation': '',
         'phone': '',
         'email': '',
         'company': '',
-        'address': ''
+        'address': '',
+        'notes': '',
+        'card_width': 0,
+        'card_height': 0
     }
     
     # ===== EMAIL PATTERN =====
+    # Clean common OCR mistakes for email
+    all_text_email = all_text.replace(' @ ', '@').replace('@ ', '@').replace(' @', '@')
+    all_text_email = all_text_email.replace(' . ', '.').replace('. ', '.').replace(' .', '.')
+    all_text_no_space_email = all_text_no_space.replace(' ', '')
+    
     email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-    email_match = re.search(email_pattern, all_text) or re.search(email_pattern, all_text_no_space)
+    email_match = re.search(email_pattern, all_text_email) or re.search(email_pattern, all_text_no_space_email)
     if email_match:
         fields['email'] = email_match.group().lower()
+    else:
+        # Try to find email in individual lines with cleaning
+        for item in ocr_lines:
+            line = item['text'].replace(' ', '')
+            email_match = re.search(email_pattern, line)
+            if email_match:
+                fields['email'] = email_match.group().lower()
+                break
     
     # ===== PHONE PATTERN =====
     # First, look for phone in individual lines (more reliable)
+    phone_candidates = []
     for item in ocr_lines:
         line = item['text']
-        digits = re.sub(r'\D', '', line)
+        # Clean common OCR mistakes in phone numbers
+        line_cleaned = line.replace('O', '0').replace('o', '0').replace('l', '1').replace('I', '1')
+        digits = re.sub(r'\D', '', line_cleaned)
         
         # Check if line has 10+ digits (phone number)
         if len(digits) >= 10:
             # Format the phone number
             if digits.startswith('91') and len(digits) >= 12:
-                fields['phone'] = '+91 ' + digits[2:12]
+                phone = '+91 ' + digits[2:12]
+            elif digits.startswith('0') and len(digits) >= 11:
+                phone = '+91 ' + digits[1:11]
             else:
-                fields['phone'] = '+91 ' + digits[:10]
-            break
+                phone = '+91 ' + digits[:10]
+            phone_candidates.append((phone, item.get('confidence', 0.5)))
+    
+    # Pick highest confidence phone
+    if phone_candidates:
+        phone_candidates.sort(key=lambda x: x[1], reverse=True)
+        fields['phone'] = phone_candidates[0][0]
     
     # Fallback: search in combined text
     if not fields['phone']:
+        # Clean OCR mistakes in combined text
+        all_text_cleaned = all_text.replace('O', '0').replace('o', '0').replace('l', '1').replace('I', '1')
         phone_patterns = [
             r'\+91[\s-]?\d{5}[\s-]?\d{5}',  # +91 format
             r'\+91[\s-]?\d{10}',             # +91 continuous
             r'(?<!\d)\d{10}(?!\d)',          # 10 digits
             r'(?<!\d)\d{5}[\s-]\d{5}(?!\d)', # 5-5 format
+            r'(?<!\d)\d{3}[\s-]\d{3}[\s-]\d{4}(?!\d)',  # 3-3-4 format
         ]
         
         for pattern in phone_patterns:
-            phone_match = re.search(pattern, all_text_no_space)
+            phone_match = re.search(pattern, all_text_cleaned)
             if phone_match:
                 phone = re.sub(r'\D', '', phone_match.group())
                 if len(phone) >= 10:
@@ -168,10 +271,15 @@ def parse_text(ocr_lines):
     
     # ===== TITLE/DESIGNATION KEYWORDS =====
     title_keywords = [
-        'ceo', 'cto', 'cfo', 'coo', 'manager', 'director', 'engineer',
-        'developer', 'analyst', 'consultant', 'founder', 'president',
-        'chairman', 'partner', 'head', 'lead', 'senior', 'junior',
-        'executive', 'officer', 'associate', 'coordinator', 'specialist'
+        'ceo', 'cto', 'cfo', 'coo', 'cmo', 'cio', 'vp', 'avp', 'svp', 'evp',
+        'manager', 'director', 'engineer', 'developer', 'analyst', 'consultant',
+        'founder', 'co-founder', 'cofounder', 'president', 'chairman', 'partner',
+        'head', 'lead', 'senior', 'junior', 'executive', 'officer', 'associate',
+        'coordinator', 'specialist', 'architect', 'designer', 'administrator',
+        'supervisor', 'team lead', 'tech lead', 'project', 'product', 'sales',
+        'marketing', 'hr', 'human resource', 'finance', 'accounting', 'legal',
+        'operations', 'business', 'strategy', 'chief', 'general', 'managing',
+        'assistant', 'intern', 'trainee', 'advisor', 'member', 'representative'
     ]
     
     # ===== ADDRESS KEYWORDS =====
@@ -187,11 +295,20 @@ def parse_text(ocr_lines):
     company_lines = []
     name_candidates = []
     address_lines = []
+    designation_lines = []
+    
+    # Calculate average y position for top/bottom detection
+    if ocr_lines:
+        all_y_positions = [item['y_pos'] for item in ocr_lines]
+        mid_y = (min(all_y_positions) + max(all_y_positions)) / 2
+    else:
+        mid_y = 0
     
     for idx, item in enumerate(ocr_lines):
         text = item['text']
         text_lower = text.lower()
         y_pos = item['y_pos']
+        text_height = item.get('height', 0)
         
         # Skip if it's email or phone
         if '@' in text or re.search(email_pattern, text):
@@ -199,7 +316,7 @@ def parse_text(ocr_lines):
             continue
         
         digits = re.sub(r'\D', '', text)
-        if len(digits) >= 10:
+        if len(digits) >= 8:
             used_lines.add(idx)
             continue
         
@@ -215,17 +332,21 @@ def parse_text(ocr_lines):
             used_lines.add(idx)
             continue
         
-        # Check for title (skip for name)
-        if any(kw in text_lower for kw in title_keywords):
-            used_lines.add(idx)
-            continue
+        # Check for title/designation
+        is_designation = any(kw in text_lower for kw in title_keywords)
+        if is_designation:
+            designation_lines.append((idx, text, y_pos))
+            # Don't add to used_lines yet - might need for name detection
         
-        # Potential name: mostly letters, 1-4 words, top half of card
+        # Almost everything else could be a name candidate
+        # Be very permissive here
         words = text.split()
-        if 1 <= len(words) <= 4:
-            letter_ratio = sum(c.isalpha() or c.isspace() for c in text) / max(len(text), 1)
-            if letter_ratio > 0.8 and not re.search(r'\d', text):
-                name_candidates.append((idx, text, y_pos))
+        if len(text) >= 2 and len(words) <= 6:
+            has_url = 'www' in text_lower or 'http' in text_lower or '.com' in text_lower
+            
+            if not has_url:
+                is_top_half = y_pos <= mid_y
+                name_candidates.append((idx, text, y_pos, text_height, is_top_half, is_designation))
     
     # ===== EXTRACT COMPANY =====
     if company_lines:
@@ -276,20 +397,94 @@ def parse_text(ocr_lines):
         if not fields['company']:
             fields['company'] = company_from_email
     
-    # ===== EXTRACT NAME =====
-    if name_candidates:
-        # Prefer candidates from top of card
-        name_candidates.sort(key=lambda x: x[2])  # Sort by y_pos
+    # ===== EXTRACT NAME (Simplified approach) =====
+    # Strategy: Name is usually the LARGEST text or the TOPMOST non-email/phone text
+    
+    # Filter out obvious non-names from candidates
+    filtered_candidates = []
+    for (idx, text, y_pos, height, is_top, is_desig) in name_candidates:
+        text_lower = text.lower()
         
-        # Filter out company name if found
-        if fields['company']:
-            name_candidates = [
-                (i, t, y) for (i, t, y) in name_candidates 
-                if t.lower() not in fields['company'].lower()
-            ]
+        # Skip if it's the company
+        if fields['company'] and (text_lower in fields['company'].lower() or fields['company'].lower() in text_lower):
+            continue
         
-        if name_candidates:
-            fields['name'] = name_candidates[0][1].title()
+        # Skip designations for primary name detection
+        if is_desig:
+            continue
+            
+        # Skip if mostly digits
+        digit_count = sum(c.isdigit() for c in text)
+        if digit_count > len(text) * 0.3:
+            continue
+        
+        filtered_candidates.append((idx, text, y_pos, height, is_top))
+    
+    if filtered_candidates:
+        # Method 1: Find the largest text in top half
+        top_half = [c for c in filtered_candidates if c[4]]
+        if top_half:
+            # Sort by height (largest first), then by position (topmost)
+            top_half.sort(key=lambda x: (-x[3], x[2]))
+            fields['name'] = top_half[0][1].title()
+        else:
+            # No top-half candidates, use largest text overall
+            filtered_candidates.sort(key=lambda x: (-x[3], x[2]))
+            fields['name'] = filtered_candidates[0][1].title()
+    
+    # If still no name, look near designation
+    if not fields['name'] and designation_lines:
+        designation_lines.sort(key=lambda x: x[2])
+        designation_y = designation_lines[0][2]
+        designation_idx = designation_lines[0][0]
+        
+        # Find text closest to (preferably above) designation
+        best_candidate = None
+        best_distance = float('inf')
+        
+        for (idx, text, y_pos, height, is_top, is_desig) in name_candidates:
+            if is_desig:  # Skip the designation itself
+                continue
+            if fields['company'] and text.lower() in fields['company'].lower():
+                continue
+                
+            distance = abs(y_pos - designation_y)
+            is_above = y_pos < designation_y
+            
+            # Prefer text above designation
+            if is_above and distance < best_distance:
+                best_distance = distance
+                best_candidate = text
+            elif not best_candidate and distance < best_distance:
+                best_distance = distance
+                best_candidate = text
+        
+        if best_candidate:
+            fields['name'] = best_candidate.title()
+    
+    # Final fallback: just pick the first line that's not email/phone/company/address
+    if not fields['name']:
+        for item in ocr_lines:
+            text = item['text']
+            text_lower = text.lower()
+            
+            if '@' in text or len(re.sub(r'\D', '', text)) >= 8:
+                continue
+            if any(kw in text_lower for kw in company_keywords + address_keywords):
+                continue
+            if fields['company'] and text_lower in fields['company'].lower():
+                continue
+            if len(text) >= 2:
+                fields['name'] = text.title()
+                break
+    
+    # ===== EXTRACT DESIGNATION =====
+    if designation_lines:
+        # Sort by y position - designation is often right below name
+        designation_lines.sort(key=lambda x: x[2])
+        # Combine all designation parts (sometimes split across lines)
+        designation_texts = [text for (_, text, _) in designation_lines]
+        fields['designation'] = ' | '.join(designation_texts) if len(designation_texts) > 1 else designation_texts[0]
     
     # ===== EXTRACT ADDRESS =====
     # First use lines with address keywords
@@ -355,24 +550,30 @@ def save_to_excel(data):
     try:
         df = pd.read_excel(file)
     except FileNotFoundError:
-        df = pd.DataFrame(columns=["name", "phone", "email", "company", "address", "timestamp"])
+        df = pd.DataFrame(columns=["name", "designation", "phone", "email", "company", "address", "notes", "card_width", "card_height", "timestamp"])
 
     df = pd.concat([df, pd.DataFrame([data])], ignore_index=True)
     df.to_excel(file, index=False)
 
 
 # ================= STREAMLIT UI =================
-st.title("Visiting Card Scanner")
-st.caption("Scan business cards and save contact information")
+st.title("📇 Business Card Scanner")
+st.markdown("**Easily digitize your business cards** — Take a photo or upload an image to extract contact details automatically.")
 
-# Input options
-tab1, tab2 = st.tabs(["Camera", "Upload File"])
+st.divider()
+
+# Input options with friendly descriptions
+st.subheader("Step 1: Add a Business Card")
+
+tab1, tab2 = st.tabs(["📷 Take Photo", "📁 Upload Image"])
 
 with tab1:
-    photo = st.camera_input("Capture card image")
+    st.markdown("*Position the card flat with good lighting for best results*")
+    photo = st.camera_input("Take a picture of the business card", label_visibility="collapsed")
 
 with tab2:
-    uploaded = st.file_uploader("Choose an image file", type=['png', 'jpg', 'jpeg'])
+    st.markdown("*Supported formats: PNG, JPG, JPEG*")
+    uploaded = st.file_uploader("Select an image file", type=['png', 'jpg', 'jpeg'], label_visibility="collapsed")
 
 # Get image from either source
 img = None
@@ -382,93 +583,159 @@ elif uploaded:
     img = Image.open(uploaded)
 
 if img:
+    st.divider()
+    st.subheader("Step 2: Extract Information")
+    
     col1, col2 = st.columns(2)
     
     with col1:
-        st.image(img, caption="Original", use_container_width=True)
+        st.image(img, caption="Your Business Card", use_container_width=True)
     
-    if st.button("Extract Information", type="primary"):
-        with st.spinner("Processing image..."):
+    if st.button("🔍 Scan Card", type="primary", use_container_width=True, help="Click to automatically extract contact information from the card"):
+        with st.spinner("Reading the card..."):
             try:
-                # Step 1: Preprocess
-                processed, original_cv = preprocess_image(img)
+                # Preprocess image
+                img_cv, processed = preprocess_image(img)
                 
-                with col2:
-                    st.image(processed, caption="Processed", use_container_width=True)
+                # Single OCR pass on enhanced image (fast)
+                ocr_lines = run_ocr(processed)
                 
-                # Step 2: OCR
-                ocr_lines = run_ocr(original_cv)
-                
-                if not ocr_lines:
-                    ocr_lines = run_ocr(processed)
+                # Only try fallback if we got very little text
+                if len(ocr_lines) < 2:
+                    enhanced = preprocess_for_difficult_cards(img_cv)
+                    ocr_lines = run_ocr(enhanced)
                 
                 if ocr_lines:
-                    # Show raw OCR
-                    with st.expander("View Raw OCR Text"):
-                        for item in ocr_lines:
-                            st.text(f"{item['text']} ({item['confidence']:.2f})")
-                    
-                    # Step 3: Parse
+                    # Parse extracted text
                     data = parse_text(ocr_lines)
                     
+                    # Capture card dimensions
+                    height, width = img_cv.shape[:2]
+                    data['card_width'] = width
+                    data['card_height'] = height
+                    
                     st.session_state['extracted_data'] = data
-                    st.success("Information extracted successfully")
+                    st.success("✅ Contact details extracted! Please review below.")
+                    
+                    # Hidden technical details for advanced users
+                    with st.expander("🔧 Technical Details (Advanced)"):
+                        st.caption("Raw text detected from the card:")
+                        for item in ocr_lines:
+                            confidence_pct = int(item['confidence'] * 100)
+                            st.text(f"• {item['text']} ({confidence_pct}% confidence)")
                 else:
-                    st.error("No text detected. Please try with a clearer image.")
+                    st.error("😕 Couldn't read the card. Please try again with:")
+                    st.markdown("""
+                    - Better lighting
+                    - Card placed flat on a plain background
+                    - A clearer, higher resolution image
+                    """)
                     
             except Exception as e:
-                st.error(f"Error: {str(e)}")
-                import traceback
-                st.code(traceback.format_exc())
+                st.error("😕 Something went wrong. Please try with a different image.")
+                with st.expander("🔧 Error Details (Advanced)"):
+                    import traceback
+                    st.code(traceback.format_exc())
 
 # Editable form
 if 'extracted_data' in st.session_state:
     st.divider()
-    st.subheader("Review & Edit")
+    st.subheader("Step 3: Review & Save")
+    st.markdown("*Check the details below and correct any mistakes before saving*")
     
     data = st.session_state['extracted_data']
     
+    # Store dimensions but don't show them prominently
+    card_width = data.get("card_width", 0)
+    card_height = data.get("card_height", 0)
+    
+    # Main contact info
     col1, col2 = st.columns(2)
     with col1:
-        name = st.text_input("Name", data.get("name", ""))
-        email = st.text_input("Email", data.get("email", ""))
+        name = st.text_input("👤 Name", data.get("name", ""), placeholder="e.g., John Smith")
+        designation = st.text_input("💼 Job Title", data.get("designation", ""), placeholder="e.g., Marketing Manager")
+        email = st.text_input("📧 Email", data.get("email", ""), placeholder="e.g., john@company.com")
     with col2:
-        phone = st.text_input("Phone", data.get("phone", ""))
-        company = st.text_input("Company", data.get("company", ""))
+        phone = st.text_input("📱 Phone", data.get("phone", ""), placeholder="e.g., +91 98765 43210")
+        company = st.text_input("🏢 Company", data.get("company", ""), placeholder="e.g., Acme Corp")
     
-    address = st.text_area("Address", data.get("address", ""), height=80)
+    address = st.text_area("📍 Address", data.get("address", ""), height=80, placeholder="Full office address...")
+    notes = st.text_area("📝 Notes", data.get("notes", ""), height=80, placeholder="Where did you meet? Any follow-up reminders?")
 
+    st.markdown("")  # Add some spacing
+    
     col_save, col_clear = st.columns([1, 1])
     with col_save:
-        if st.button("Save Contact", type="primary", use_container_width=True):
-            final_data = {
-                "name": name, "phone": phone, "email": email,
-                "company": company, "address": address
-            }
-            save_to_excel(final_data)
-            st.success("Contact saved!")
-            del st.session_state['extracted_data']
-            st.rerun()
+        if st.button("💾 Save Contact", type="primary", use_container_width=True):
+            if not name.strip():
+                st.warning("Please enter a name before saving.")
+            else:
+                final_data = {
+                    "name": name, "designation": designation, "phone": phone, "email": email,
+                    "company": company, "address": address, "notes": notes,
+                    "card_width": card_width, "card_height": card_height
+                }
+                save_to_excel(final_data)
+                st.success("🎉 Contact saved successfully!")
+                st.balloons()
+                del st.session_state['extracted_data']
+                st.rerun()
     with col_clear:
-        if st.button("Clear", use_container_width=True):
+        if st.button("🗑️ Discard", use_container_width=True, help="Clear the form without saving"):
             del st.session_state['extracted_data']
             st.rerun()
 
 # Download section
 st.divider()
-st.subheader("Saved Contacts")
+st.subheader("📋 Your Contacts")
 
 try:
     df = pd.read_excel("cards.xlsx")
-    st.caption(f"Total: {len(df)} contacts")
     
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    # Show count with friendly message
+    contact_count = len(df)
+    if contact_count == 1:
+        st.success(f"You have **{contact_count} contact** saved")
+    else:
+        st.success(f"You have **{contact_count} contacts** saved")
     
+    # Display table with user-friendly column names
+    display_df = df.copy()
+    display_columns = {
+        'name': 'Name',
+        'designation': 'Job Title', 
+        'phone': 'Phone',
+        'email': 'Email',
+        'company': 'Company',
+        'address': 'Address',
+        'notes': 'Notes',
+        'timestamp': 'Added On'
+    }
+    # Only rename columns that exist
+    display_df = display_df.rename(columns={k: v for k, v in display_columns.items() if k in display_df.columns})
+    
+    # Hide technical columns from display
+    columns_to_hide = ['card_width', 'card_height']
+    for col in columns_to_hide:
+        if col in display_df.columns:
+            display_df = display_df.drop(columns=[col])
+    
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    
+    # Download button with friendly label
+    st.markdown("")
     with open("cards.xlsx", "rb") as f:
         st.download_button(
-            "Download Excel", f,
-            file_name="visiting_cards.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            "📥 Download All Contacts (Excel)",
+            f,
+            file_name="my_contacts.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            help="Download all your saved contacts as an Excel file"
         )
 except FileNotFoundError:
-    st.caption("No contacts saved yet. Scan a card to get started.")
+    st.info("👋 No contacts yet! Scan your first business card above to get started.")
+
+# Footer
+st.divider()
+st.caption("💡 **Tip:** For best results, take photos in good lighting with the card flat on a plain background.")

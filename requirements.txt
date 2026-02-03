@@ -2,6 +2,8 @@ streamlit
 pillow
 pandas
 openpyxl
-easyocr
 numpy
 opencv-python-headless
+torch
+torchvision
+easyocr
